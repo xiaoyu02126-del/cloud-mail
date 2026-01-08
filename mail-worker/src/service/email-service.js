@@ -19,19 +19,16 @@ import kvConst from '../const/kv-const';
 import { t } from '../i18n/i18n'
 import r2Service from './r2-service';
 import domainUtils from '../utils/domain-uitls';
-import account from "../entity/account";
 
 const emailService = {
 
 	async list(c, params, userId) {
 
-		let { emailId, type, accountId, size, timeSort, allReceive } = params;
+		let { emailId, type, accountId, size, timeSort } = params;
 
 		size = Number(size);
 		emailId = Number(emailId);
 		timeSort = Number(timeSort);
-		accountId = Number(accountId);
-		allReceive = Number(allReceive);
 
 		if (size > 30) {
 			size = 30;
@@ -47,10 +44,6 @@ const emailService = {
 
 		}
 
-		if (isNaN(allReceive)) {
-			let accountRow = await accountService.selectById(c, accountId);
-			allReceive = accountRow.allReceive;
-		}
 
 		const query = orm(c)
 			.select({
@@ -64,18 +57,14 @@ const emailService = {
 					eq(star.emailId, email.emailId),
 					eq(star.userId, userId)
 				)
-			).leftJoin(
-				account,
-				eq(account.accountId, email.accountId)
 			)
 			.where(
 				and(
-					allReceive ? eq(1,1) : eq(email.accountId, accountId),
 					eq(email.userId, userId),
+					eq(email.accountId, accountId),
 					timeSort ? gt(email.emailId, emailId) : lt(email.emailId, emailId),
 					eq(email.type, type),
-					eq(email.isDel, isDel.NORMAL),
-					eq(account.isDel, isDel.NORMAL)
+					eq(email.isDel, isDel.NORMAL)
 				)
 			);
 
@@ -87,29 +76,23 @@ const emailService = {
 
 		const listQuery = query.limit(size).all();
 
-		const totalQuery = orm(c).select({ total: count() }).from(email)
-			.leftJoin(
-				account,
-				eq(account.accountId, email.accountId)
+		const totalQuery = orm(c).select({ total: count() }).from(email).where(
+			and(
+				eq(email.accountId, accountId),
+				eq(email.userId, userId),
+				eq(email.type, type),
+				eq(email.isDel, isDel.NORMAL)
 			)
-			.where(
-				and(
-					allReceive ? eq(1,1) : eq(email.accountId, accountId),
-					eq(email.userId, userId),
-					eq(email.type, type),
-					eq(email.isDel, isDel.NORMAL),
-					eq(account.isDel, isDel.NORMAL)
-				)
 		).get();
 
 		const latestEmailQuery = orm(c).select().from(email).where(
 			and(
-				allReceive ? eq(1,1) : eq(email.accountId, accountId),
+				eq(email.accountId, accountId),
 				eq(email.userId, userId),
 				eq(email.type, type),
 				eq(email.isDel, isDel.NORMAL)
 			))
-			.orderBy(desc(email.emailId)).limit(size).get();
+			.orderBy(desc(email.emailId)).limit(1).get();
 
 		let [list, totalRow, latestEmail] = await Promise.all([listQuery, totalQuery, latestEmailQuery]);
 
@@ -126,14 +109,6 @@ const emailService = {
 			const atts = attsList.filter(attsRow => attsRow.emailId === emailRow.emailId);
 			emailRow.attList = atts;
 		});
-
-		if (!latestEmail) {
-			latestEmail = {
-				emailId: 0,
-				accountId: accountId,
-				userId: userId,
-			}
-		}
 
 		return { list, total: totalRow.total, latestEmail };
 	},
@@ -170,7 +145,7 @@ const emailService = {
 
 		const { resendTokens, r2Domain, send } = await settingService.query(c);
 
-		let { imageDataList, html } = await attService.toImageUrlHtml(c, content);
+		let { attDataList, html } = await attService.toImageUrlHtml(c, content, r2Domain);
 
 		if (send === settingConst.send.CLOSE) {
 			throw new BizError(t('disabledSend'), 403);
@@ -195,6 +170,23 @@ const emailService = {
 				if (roleRow.sendType === 'count') throw new BizError(t('totalSendLack'), 403);
 			}
 
+		}
+
+
+		if (attDataList.length > 0 && !r2Domain) {
+			throw new BizError(t('noOsDomainSendPic'));
+		}
+
+		if (attDataList.length > 0 && !await r2Service.hasOSS(c)) {
+			throw new BizError(t('noOsSendPic'));
+		}
+
+		if (attachments.length > 0 && !r2Domain) {
+			throw new BizError(t('noOsDomainSendAtt'));
+		}
+
+		if (attachments.length > 0 && !await r2Service.hasOSS(c)) {
+			throw new BizError(t('noOsSendAtt'));
 		}
 
 		if (attachments.length > 0 && manyType === 'divide') {
@@ -250,7 +242,6 @@ const emailService = {
 
 		const resend = new Resend(resendToken);
 
-		//如果是分开发送
 		if (manyType === 'divide') {
 
 			let sendFormList = [];
@@ -284,7 +275,7 @@ const emailService = {
 				subject: subject,
 				text: text,
 				html: html,
-				attachments: [...imageDataList, ...attachments]
+				attachments: attachments
 			};
 
 			if (sendType === 'reply') {
@@ -305,10 +296,7 @@ const emailService = {
 			throw new BizError(error.message);
 		}
 
-		imageDataList = imageDataList.map(item => ({...item, contentId: `<${item.contentId}>`}))
-
-		//把图片标签cid标签切换会通用url
-		html = this.imgReplace(html, imageDataList, r2Domain);
+		html = this.imgReplace(html, null, r2Domain);
 
 		const emailData = {};
 		emailData.sendEmail = accountRow.email;
@@ -360,15 +348,14 @@ const emailService = {
 		}
 
 		const emailRowList = await Promise.all(
-
 			emailDataList.map(async (emailData) => {
 				const emailRow = await orm(c).insert(email).values(emailData).returning().get();
 
-				if (imageDataList.length > 0) {
-					await attService.saveArticleAtt(c, imageDataList, userId, accountId, emailRow.emailId);
+				if (attDataList.length > 0) {
+					await attService.saveArticleAtt(c, attDataList, userId, accountId, emailRow.emailId);
 				}
 
-				if (attachments?.length > 0) {
+				if (attachments?.length > 0 && await r2Service.hasOSS(c)) {
 					await attService.saveSendAtt(c, attachments, userId, accountId, emailRow.emailId);
 				}
 
@@ -444,28 +431,15 @@ const emailService = {
 	},
 
 	async latest(c, params, userId) {
-		let { emailId, accountId, allReceive } = params;
-		allReceive = Number(allReceive);
-
-		if (isNaN(allReceive)) {
-			let accountRow = await accountService.selectById(c, accountId);
-			allReceive = accountRow.allReceive;
-		}
-
-		const list = await orm(c).select({...email}).from(email)
-			.leftJoin(
-				account,
-				eq(account.accountId, email.accountId)
-			)
-			.where(
-				and(
-					eq(email.userId, userId),
-					eq(email.isDel, isDel.NORMAL),
-					eq(account.isDel, isDel.NORMAL),
-					allReceive ? eq(1,1) : eq(email.accountId, accountId),
-					eq(email.type, emailConst.type.RECEIVE),
-					gt(email.emailId, emailId)
-				))
+		let { emailId, accountId } = params;
+		const list = await orm(c).select().from(email).where(
+			and(
+				eq(email.userId, userId),
+				eq(email.isDel, isDel.NORMAL),
+				eq(email.accountId, accountId),
+				eq(email.type, emailConst.type.RECEIVE),
+				gt(email.emailId, emailId)
+			))
 			.orderBy(desc(email.emailId))
 			.limit(20);
 
@@ -515,8 +489,7 @@ const emailService = {
 			.where(and(
 				inArray(email.userId, userIds),
 				eq(email.type, type),
-				eq(email.isDel, del),
-				ne(email.status, emailConst.status.SAVING),
+				eq(email.isDel, del)
 			))
 			.groupBy(email.userId);
 		return result;
@@ -638,11 +611,6 @@ const emailService = {
 		}).where(eq(email.emailId, emailId)).returning().get();
 	},
 
-	async completeReceiveAll(c) {
-			await c.env.db.prepare(`UPDATE email as e SET status = ${emailConst.status.RECEIVE} WHERE status = ${emailConst.status.SAVING} AND EXISTS (SELECT 1 FROM account WHERE account_id = e.account_id)`).run();
-			await c.env.db.prepare(`UPDATE email as e SET status = ${emailConst.status.NOONE} WHERE status = ${emailConst.status.SAVING} AND NOT EXISTS (SELECT 1 FROM account WHERE account_id = e.account_id)`).run();
-	},
-
 	async batchDelete(c, params) {
 		let { sendName, sendEmail, toEmail, subject, startTime, endTime, type  } = params
 
@@ -687,16 +655,6 @@ const emailService = {
 		await attService.removeByEmailIds(c, emailIds);
 
 		await orm(c).delete(email).where(conditions.length > 1 ? and(...conditions) : conditions[0]).run();
-	},
-
-	async physicsDeleteByAccountId(c, accountId) {
-		await attService.removeByAccountId(c, accountId);
-		await orm(c).delete(email).where(eq(email.accountId, accountId)).run();
-	},
-
-	async read(c, params, userId) {
-		const { emailIds } = params;
-		await orm(c).update(email).set({ unread: emailConst.unread.READ }).where(and(eq(email.userId, userId), inArray(email.emailId, emailIds)));
 	}
 };
 
